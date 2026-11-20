@@ -752,7 +752,13 @@ def dispatch_rollout_weight_quantizer(
         getattr(hf_config, "model_type", None),
         getattr(getattr(hf_config, "text_config", None), "model_type", None),
     }
-    if has_override:
+    if getattr(rollout_quantization, "method", None) == "ascend":
+        # ModelSlim microscaling: the config object derives the per-layer
+        # description from the checkpoint, and the trainer quantizes online.
+        from verl.utils.qat.ascend_mx import ascend_quantization_config
+
+        quantization_config = ascend_quantization_config(model_config.local_path)
+    elif has_override:
         if model_types & _DEEPSEEK_V4_MODEL_TYPES:
             raise NotImplementedError(
                 "rollout.quantization overrides are not supported for DeepSeek-V4: the trainer exports its "
@@ -799,6 +805,12 @@ def dispatch_rollout_weight_quantizer(
             "override_transformer_config.fp4 trains routed experts in per-token NVFP4; "
             "set rollout.quantization.moe=NVFP4"
         )
+    if quant_method == "ascend":
+        from verl.utils.qat.ascend_mx import AscendMxWeightExporter
+
+        # The engine and the trainer must read the same description, so resolve it
+        # from the model directory instead of from the config dict.
+        return AscendMxWeightExporter.from_model_path(model_config.local_path)
     if quant_method == "compressed-tensors":
         _check_required_activations(quantization_config, "rollout quantization_config")
         qat_modes = qat_modes_for_config(quantization_config) if qat_mode is not None else set()

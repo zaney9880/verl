@@ -161,13 +161,27 @@ class RolloutQuantizationConfig(BaseConfig):
     ignore: list[str] = field(default_factory=list)
     # compressed-tensors quantization_config JSON, used as is; exclusive with the fields above.
     config_file: Optional[str] = None
+    # Backend method. "ascend" selects Ascend ModelSlim microscaling, where
+    # ``linear``/``moe`` name the vllm-ascend schemes (W8A8_MXFP8 / W4A8_MXFP)
+    # and the trainer quantizes online -- no ModelSlim checkpoint is required.
+    method: Optional[str] = None
 
     @property
     def enabled(self) -> bool:
-        return bool(self.linear or self.moe or self.config_file)
+        return bool(self.linear or self.moe or self.config_file or self.method)
 
     def build_quantization_config(self, model_path: str) -> dict[str, Any]:
         """HF ``quantization_config`` the rollout engine starts from and the trainer quantizes refits to."""
+        if self.method == "ascend":
+            from verl.utils.qat.ascend_mx import ascend_quantization_config
+
+            if self.linear or self.moe or self.config_file:
+                raise ValueError(
+                    "rollout.quantization.method='ascend' takes the per-layer schemes from "
+                    "quant_model_description.json; drop linear/moe/config_file."
+                )
+            return ascend_quantization_config(model_path)
+
         from verl.utils.qat.compressed_tensors import build_compressed_tensors_config
 
         return build_compressed_tensors_config(

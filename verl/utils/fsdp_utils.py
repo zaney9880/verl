@@ -476,6 +476,45 @@ def get_fsdp_full_state_dict(model: torch.nn.Module, offload_to_cpu: bool = True
         raise NotImplementedError(f"Unknown FSDP version {fsdp_version}")
 
 
+_EP_MESH_DIMS = frozenset({"ep", "efsdp", "edp"})
+
+
+def _move_states_for_fsdp_load(model: torch.nn.Module, device, *, empty: bool) -> None:
+    """Move FSDP-owned states to ``device`` for ``set_model_state_dict``.
+
+    Plain tensors and FSDP shard DTensors are re-created on ``device`` (or left
+    uninitialized when ``empty``); expert-parallel DTensors are already owned and
+    placed by FSDP-Turbo, so they are left untouched.
+    """
+    moved = skipped = 0
+    for module in model.modules():
+        for name, param in list(module._parameters.items()):
+            if param is None:
+                continue
+            if isinstance(param, DTensor):
+                dims = set(param.device_mesh.mesh_dim_names or ())
+                if dims & _EP_MESH_DIMS:
+                    skipped += 1
+                    continue
+                local = param.to_local()
+                new_local = torch.empty_like(local, device=device) if empty else local.to(device)
+                module._parameters[name] = torch.nn.Parameter(
+                    DTensor.from_local(new_local, param.device_mesh, param.placements),
+                    requires_grad=param.requires_grad,
+                )
+                moved += 1
+                continue
+            new = torch.empty(param.shape, dtype=param.dtype, device=device, layout=param.layout) if empty else param.detach().to(device)
+            module._parameters[name] = torch.nn.Parameter(new, requires_grad=param.requires_grad)
+            moved += 1
+        for name, buf in list(module._buffers.items()):
+            if buf is None or isinstance(buf, DTensor):
+                continue
+            module._buffers[name] = torch.empty_like(buf, device=device) if empty else buf.to(device)
+    if dist.get_rank() == 0:
+        print(f"[ep-load] moved={moved} ep_dtensor_skipped={skipped} empty={empty}", flush=True)
+
+
 def fsdp2_load_full_state_dict(model: torch.nn.Module, full_state: dict, device_mesh=None, cpu_offload=None):
     """
     Loads the full state dict (could be only on rank 0) into the sharded model. This is done by broadcasting the
@@ -494,10 +533,15 @@ def fsdp2_load_full_state_dict(model: torch.nn.Module, full_state: dict, device_
         from verl.third_party.torch.distributed.checkpoint.state_dict import StateDictOptions, set_model_state_dict
 
     # To broadcast, it needs to be instantiated in the GPU.
-    if dist.get_rank() == 0:
-        model = model.to(device=get_device_id(), non_blocking=True)
-    else:
-        model = model.to_empty(device=get_device_id())
+    #
+    # With FSDP-Turbo expert parallelism the model holds two kinds of DTensors:
+    # FSDP shards over the dp_fsdp mesh (must be moved to the accelerator) and
+    # expert-parallel shards over the ep/efsdp/edp mesh, which FSDP-Turbo places
+    # itself and keeps outside the root FSDP plan. ``Module.to()`` rebuilds every
+    # ``nn.Parameter`` and cannot tell them apart, so move state by state.
+    _device = get_device_id()
+    _empty = dist.get_rank() != 0
+    _move_states_for_fsdp_load(model, _device, empty=_empty)
 
     cpu_offload = cpu_offload is not None
     options = StateDictOptions(full_state_dict=True, cpu_offload=cpu_offload, broadcast_from_rank0=True)

@@ -33,7 +33,14 @@ from verl.utils.qat.compressed_tensors import (
     qat_modes_for_config,
 )
 
+from verl.utils.qat.ascend_mx import (
+    ASCEND_MX_SCHEMES,
+    AscendMxWeightExporter,
+)
+
 __all__ = [
+    "ASCEND_MX_SCHEMES",
+    "AscendMxWeightExporter",
     "CompressedTensorsWeightQuantizer",
     "Fp8ConfigWeightQuantizer",
     "build_compressed_tensors_config",

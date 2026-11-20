@@ -861,6 +861,7 @@ class FSDPEngine(BaseEngine):
             offload_fsdp_optimizer(self.optimizer)
 
     def get_per_tensor_param_shard(self, **kwargs):
+        self._reject_quantized_shard_export()
         """Like :meth:`get_per_tensor_param`, but yields each rank's *local* FSDP shard
         ``(name, local_flat_shard_bf16, ShardSpec)`` instead of all-gathering the full
         tensor. Pure DTensor export, no side effects -- delta bookkeeping lives in
@@ -906,6 +907,7 @@ class FSDPEngine(BaseEngine):
         return _hf_entry_identity(name, spec, place, lidx, lval)
 
     def get_per_tensor_param_delta_shard(self, **kwargs):
+        self._reject_quantized_shard_export()
         """Yield the delta engine's steady payloads -- FINAL HF-coordinate entries
         ``(slots, dtype_str, counts, hf_idx, hf_val, gather_group)`` per parameter.
         Weight->HF naming, to-HF conversion, diff and snapshot are all backend
@@ -918,6 +920,21 @@ class FSDPEngine(BaseEngine):
         self._delta_shard_snap = getattr(self, "_delta_shard_snap", {})
         gen, _ = self.get_per_tensor_param_shard()
         return hf_delta_export(gen, self._delta_shard_snap, self._hf_delta_entry), None
+
+    def set_rollout_weight_quantizer(self, quantizer) -> None:
+        """Quantize the rollout-bound export, see :meth:`Engine.set_rollout_weight_quantizer`."""
+        self._rollout_weight_quantizer = quantizer
+
+    def _apply_rollout_weight_quantizer(self, per_tensor_param):
+        quantizer = getattr(self, "_rollout_weight_quantizer", None)
+        return quantizer(per_tensor_param) if quantizer is not None else per_tensor_param
+
+    def _reject_quantized_shard_export(self) -> None:
+        if getattr(self, "_rollout_weight_quantizer", None) is not None:
+            raise NotImplementedError(
+                "Per-shard rollout export does not support a quantized rollout: mx scales must be "
+                "computed on the full weight, and delta_sharded bypasses the trainer-side quantizer."
+            )
 
     def get_per_tensor_param(self, layered_summon=False, base_sync_done=False, **kwargs):
         log_gpu_memory_usage("Before load_fsdp_model_to_gpu", logger=logger)
@@ -956,7 +973,7 @@ class FSDPEngine(BaseEngine):
                 # restores the un-merged base weights on exit, so tensors must be
                 # materialized while the context is still open (inside the generator).
                 # Materializing after exit silently sends base weights without adapters.
-                return self._merged_lora_per_tensor_param(), None
+                return self._apply_rollout_weight_quantizer(self._merged_lora_per_tensor_param()), None
         else:
             params = self.module.state_dict()
 
@@ -979,6 +996,7 @@ class FSDPEngine(BaseEngine):
                 for name, param in params.items()
             )
             per_tensor_param = unfuse_moe_params(per_tensor_param, self.model_config.hf_config.model_type)
+            per_tensor_param = self._apply_rollout_weight_quantizer(per_tensor_param)
 
         peft_config_dict = peft_config.to_dict() if peft_config is not None else None
         return per_tensor_param, peft_config_dict

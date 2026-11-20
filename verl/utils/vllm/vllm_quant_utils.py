@@ -138,8 +138,41 @@ def is_quantized_model(vllm_config):
             return True
         elif is_compressed_tensors_model(vllm_config):
             return True
+        elif is_vllm_ascend_mx_quant(vllm_config.quant_config):
+            return True
 
     return False
+
+
+def is_vllm_ascend_mx_quant(quant_config) -> bool:
+    """Ascend ModelSlim microscaling rollout (W8A8_MXFP8 / W4A8_MXFP).
+
+    The engine keeps packed weights (uint8 fp4 bytes, or fp8) plus separate
+    scale tensors, so the refit must stage/restore layouts instead of loading
+    plain bf16 through the regular loader.
+    """
+    try:
+        # Package-root import survives module moves inside vllm-ascend.
+        from vllm_ascend.quantization import AscendModelSlimConfig
+    except ImportError:
+        return False
+    if not isinstance(quant_config, AscendModelSlimConfig):
+        return False
+    from verl.utils.qat.ascend_mx import ASCEND_MX_SCHEMES
+
+    description = getattr(quant_config, "quant_description", None) or {}
+    return any(value in ASCEND_MX_SCHEMES for value in description.values())
+
+
+def is_w4a8_mx_weight(module) -> bool:
+    """Whether a module holds packed fp4 (W4A8_MXFP) weights."""
+    from vllm.model_executor.layers.linear import LinearBase
+
+    if isinstance(module, LinearBase):
+        return getattr(module.weight, "dtype", None) == torch.uint8
+    w13 = getattr(module, "w13_weight", None)
+    w2 = getattr(module, "w2_weight", None)
+    return getattr(w13, "dtype", None) == torch.uint8 and getattr(w2, "dtype", None) == torch.uint8
 
 
 def is_compressed_tensors_model(vllm_config) -> bool:
@@ -208,6 +241,52 @@ def refresh_rocm_attention_weight_caches(model):
             module._dsv4_wo_a_bf16 = live
 
 
+def _ascend_mx_transformed(module) -> bool:
+    from verl.utils.qat.ascend_mx import ASCEND_MX_SCHEMES
+
+    return any(getattr(module, scheme.restore_attr, False) for scheme in ASCEND_MX_SCHEMES.values())
+
+
+def stage_ascend_mx_params_for_loading(model):
+    """Undo vllm-ascend's inference layout so its weight loader can reload ND weights.
+
+    W8A8_MXFP8 / W4A8_MXFP cast the weight to FRACTAL_NZ and reshape the scale in
+    ``process_weights_after_loading``; the quant method exposes the inverse.
+    Modules that were never transformed are skipped, so this is safe for any
+    quantization scheme.
+    """
+    restored = []
+    for module in model.modules():
+        quant_method = getattr(module, "quant_method", None)
+        scheme = getattr(quant_method, "quant_method", None)
+        restore = getattr(scheme, "restore_weights_for_rl_loading", None)
+        if restore is None or not _ascend_mx_transformed(module):
+            continue
+        restore(module)
+        restored.append(module)
+    return restored
+
+
+def process_ascend_mx_weights_after_loading(modules, vllm_config=None):
+    """Re-apply the inference layout undone by :func:`stage_ascend_mx_params_for_loading`.
+
+    vllm-ascend rebuilds kernel layouts here and reads ``get_current_vllm_config()``
+    inside, so provide the context when the caller has the engine config.
+    """
+    if not modules:
+        return
+    context = nullcontext()
+    if vllm_config is not None:
+        try:
+            from vllm.config.vllm import get_current_vllm_config_or_none, set_current_vllm_config
+
+            if get_current_vllm_config_or_none() is None:
+                context = set_current_vllm_config(vllm_config)
+        except ImportError:
+            pass
+    with context:
+        for module in modules:
+            module.quant_method.process_weights_after_loading(module)
 def prepare_quanted_weights_for_loading(model):
     """Restore quantized params to the layout their ``weight_loader`` expects.
 
@@ -222,6 +301,7 @@ def prepare_quanted_weights_for_loading(model):
         "fp8_layers": stage_fp8_params_for_loading(model),
         "mxfp4_moe_modules": stage_mxfp4_moe_params_for_loading(model),
         "nvfp4_moe_modules": stage_nvfp4_moe_params_for_loading(model),
+        "ascend_mx_modules": stage_ascend_mx_params_for_loading(model),
         # Routed experts a quantized model keeps in BF16 (e.g. its first and last layers).
         "unquantized_moe_modules": unquantized_moe_modules(model),
         "staged_unquantized_moe_modules": stage_unquantized_moe_params(model),
@@ -229,12 +309,19 @@ def prepare_quanted_weights_for_loading(model):
     return reload_state
 
 
-def process_quanted_weights_after_loading(model, reload_state):
-    """Re-apply the inference layout undone by ``prepare_quanted_weights_for_loading``."""
+def process_quanted_weights_after_loading(model, reload_state, vllm_config=None):
+    """Re-apply the inference layout undone by ``prepare_quanted_weights_for_loading``.
+
+    ``vllm_config`` is the running engine config; Ascend schemes read it through
+    ``get_current_vllm_config()`` while re-applying their kernel layout.
+    """
     reload_state = reload_state or {}
     process_fp8_weights_after_loading(reload_state.get("fp8_layers") or [])
     process_mxfp4_moe_weights_after_loading(reload_state.get("mxfp4_moe_modules") or [])
     process_nvfp4_moe_weights_after_loading(reload_state.get("nvfp4_moe_modules") or [])
+    process_ascend_mx_weights_after_loading(
+        reload_state.get("ascend_mx_modules") or [], vllm_config=vllm_config
+    )
     # Every BF16 expert layer, staged or not: a kernel prep that keeps the shape can still
     # reorder the weights (FlashInfer CUTLASS swaps gate and up).
     with fold_unquantized_moe_params(reload_state.get("staged_unquantized_moe_modules") or []):
